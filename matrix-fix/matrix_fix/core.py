@@ -1,0 +1,610 @@
+"""Correzione delle micro-imprecisioni geometriche di profili 2D (matrici di estrusione).
+
+Il modulo non dipende da ezdxf: lavora su una lista di ``Contour`` (polilinee con
+bulge, linee, archi, centri di cerchi) espressi in coordinate WCS 2D.
+
+Idea di fondo
+-------------
+1. **Topologia**: i vertici più vicini di ``merge_tol`` vengono fusi in un unico
+   nodo (chiude le micro-aperture fra entità, elimina i micro-segmenti).
+2. **Direzioni**: ogni segmento rettilineo ha una direzione. Le direzioni quasi
+   uguali (anche fra polilinee diverse) vengono raggruppate in un'unica direzione
+   esatta (parallelismo), poi agganciate a 0°/90° o alla griglia angolare
+   (orizzontali/verticali, 45°, ...), poi i gruppi quasi ortogonali fra loro
+   vengono resi esattamente ortogonali.
+3. **Tangenze**: gli archi tangenti (a meno di ``tangent_tol``) a segmenti
+   rettilinei ricevono angolo al centro e direzione della corda tali da essere
+   esattamente tangenti alle direzioni corrette.
+4. **Allineamenti**: segmenti paralleli con offset quasi uguale diventano
+   collineari; vertici con X (o Y) quasi uguale vengono allineati.
+5. **Risoluzione**: con le direzioni fissate, tutti i vincoli sono *lineari*
+   nelle coordinate dei nodi (es. ``n · (B - A) = 0``). Si cerca lo spostamento
+   di norma minima che li soddisfa tutti (minimi quadrati vincolati), quindi la
+   geometria si muove solo di quanto strettamente necessario.
+"""
+from __future__ import annotations
+
+import math
+from dataclasses import dataclass, field
+
+import numpy as np
+from scipy.sparse import csr_matrix
+from scipy.sparse.linalg import lsqr
+from scipy.spatial import cKDTree
+
+
+@dataclass
+class Params:
+    lin_tol: float = 0.02  # mm: errore lineare massimo considerato "micro-errore"
+    angle_tol: float = 0.1  # gradi: errore angolare sempre corretto
+    max_angle: float = 1.0  # gradi: limite assoluto (vale per segmenti corti)
+    angle_step: float = 15.0  # gradi: griglia angolare (0 = solo 0°/90°)
+    tangent_tol: float = 1.0  # gradi: oltre questo una giunzione è uno spigolo
+    merge_tol: float | None = None  # mm: default = lin_tol
+    align_vertices: bool = True
+    max_move: float | None = None  # mm: default = 5 * lin_tol
+
+    @property
+    def merge(self) -> float:
+        return self.lin_tol if self.merge_tol is None else self.merge_tol
+
+    @property
+    def move_limit(self) -> float:
+        return 5 * self.lin_tol if self.max_move is None else self.max_move
+
+
+@dataclass
+class Contour:
+    """Una entità del disegno in coordinate WCS 2D.
+
+    ``kind`` è "polyline", "line", "arc" (due punti, bulge sul primo) oppure
+    "point" (centro di un cerchio: partecipa solo agli allineamenti).
+    ``bulges[i]`` è il bulge del segmento che parte dal vertice i (convenzione DXF).
+    """
+
+    key: object
+    points: list[tuple[float, float]]
+    bulges: list[float]
+    closed: bool = False
+    kind: str = "polyline"
+
+
+@dataclass
+class FixedContour:
+    key: object
+    points: list[tuple[float, float]]
+    bulges: list[float]
+    closed: bool
+    src_index: list[int]  # indice del vertice originale da cui proviene ogni vertice
+    deleted: bool = False
+
+
+@dataclass
+class Report:
+    merged_gaps: int = 0
+    removed_micro_segments: int = 0
+    straightened_bulges: int = 0
+    direction_groups: int = 0
+    snapped_lines: int = 0
+    perpendicular_groups: int = 0
+    tangent_arcs: int = 0
+    collinear_groups: int = 0
+    aligned_vertex_groups: int = 0
+    max_line_deviation_deg: float = 0.0
+    max_displacement: float = 0.0
+    residual: float = 0.0
+    details: list[str] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
+
+    def summary(self) -> str:
+        rows = [
+            ("Aperture chiuse (vertici fusi)", self.merged_gaps),
+            ("Micro-segmenti rimossi", self.removed_micro_segments),
+            ("Micro-archi raddrizzati", self.straightened_bulges),
+            ("Gruppi di direzione (paralleli)", self.direction_groups),
+            ("Segmenti con direzione corretta", self.snapped_lines),
+            ("Gruppi resi ortogonali", self.perpendicular_groups),
+            ("Archi resi tangenti", self.tangent_arcs),
+            ("Gruppi di segmenti resi collineari", self.collinear_groups),
+            ("Gruppi di vertici allineati", self.aligned_vertex_groups),
+            ("Errore angolare massimo trovato [°]", f"{self.max_line_deviation_deg:.6f}"),
+            ("Spostamento massimo di un vertice [mm]", f"{self.max_displacement:.6f}"),
+            ("Residuo dei vincoli dopo la correzione", f"{self.residual:.2e}"),
+        ]
+        width = max(len(r[0]) for r in rows)
+        return "\n".join(f"{name:<{width}}  {value}" for name, value in rows)
+
+
+class GeometryError(RuntimeError):
+    pass
+
+
+# ----------------------------------------------------------------------------
+# utilità angolari
+
+def _undirected_dist(a: float, b: float) -> float:
+    """Distanza fra due direzioni non orientate (radianti, modulo pi)."""
+    d = (a - b) % math.pi
+    return min(d, math.pi - d)
+
+
+def _wrap_pi(a: float) -> float:
+    return (a + math.pi) % (2 * math.pi) - math.pi
+
+
+def _normal(angle_deg: float) -> tuple[float, float]:
+    """Normale unitaria alla direzione ``angle_deg``; esatta per i multipli di 90°."""
+    k = angle_deg / 90.0
+    if abs(k - round(k)) < 1e-12:
+        return [(0.0, 1.0), (-1.0, 0.0)][int(round(k)) % 2]
+    r = math.radians(angle_deg)
+    return (-math.sin(r), math.cos(r))
+
+
+class _UnionFind:
+    def __init__(self, n: int):
+        self.parent = list(range(n))
+
+    def find(self, i: int) -> int:
+        while self.parent[i] != i:
+            self.parent[i] = self.parent[self.parent[i]]
+            i = self.parent[i]
+        return i
+
+    def union(self, a: int, b: int) -> None:
+        ra, rb = self.find(a), self.find(b)
+        if ra != rb:
+            self.parent[max(ra, rb)] = min(ra, rb)
+
+
+def _cluster_1d(values: list[tuple[float, int]], tol: float) -> list[list[int]]:
+    """Raggruppa valori scalari: un gruppo non si estende oltre ``tol`` dal primo."""
+    groups, current, start = [], [], None
+    for value, item in sorted(values):
+        if start is None or value - start > tol:
+            if len(current) > 1:
+                groups.append(current)
+            current, start = [], value
+        current.append(item)
+    if len(current) > 1:
+        groups.append(current)
+    return groups
+
+
+# ----------------------------------------------------------------------------
+# modello interno
+
+@dataclass
+class _Edge:
+    a: int
+    b: int
+    bulge: float
+    contour: int
+    is_line: bool
+    length: float = 0.0
+    angle: float = 0.0  # direzione della corda A->B, radianti
+    group: int = -1  # gruppo di direzione (solo segmenti)
+    new_bulge: float | None = None
+    chord_normal: tuple[float, float] | None = None
+
+
+@dataclass
+class _DirGroup:
+    angle: float  # gradi in [0, 180)
+    sx: float = 0.0
+    sy: float = 0.0
+    members: list[int] = field(default_factory=list)
+    lmax: float = 0.0
+    total: float = 0.0
+    fixed: bool = False
+
+
+class _Fixer:
+    def __init__(self, contours: list[Contour], params: Params):
+        self.contours = contours
+        self.p = params
+        self.report = Report()
+
+    # -- tolleranza combinata angolo / spostamento laterale ----------------
+    def _within(self, d: float, length: float) -> bool:
+        if d <= math.radians(self.p.angle_tol):
+            return True
+        return d <= math.radians(self.p.max_angle) and length * math.sin(d) <= self.p.lin_tol
+
+    # -- 1. topologia -------------------------------------------------------
+    def build_nodes(self) -> None:
+        raw, owner = [], []
+        for ci, c in enumerate(self.contours):
+            for vi, pt in enumerate(c.points):
+                raw.append(pt)
+                owner.append((ci, vi))
+        self.raw = np.array(raw, dtype=float).reshape(-1, 2)
+        uf = _UnionFind(len(raw))
+        mergeable = [self.contours[ci].kind != "point" for ci, _ in owner]
+        if len(raw) > 1:
+            for i, j in cKDTree(self.raw).query_pairs(self.p.merge):
+                if mergeable[i] and mergeable[j]:
+                    uf.union(i, j)
+        roots: dict[int, int] = {}
+        self.raw_node = []
+        for i in range(len(raw)):
+            self.raw_node.append(roots.setdefault(uf.find(i), len(roots)))
+        n = len(roots)
+        sums = np.zeros((n, 2))
+        counts = np.zeros(n)
+        for i, node in enumerate(self.raw_node):
+            sums[node] += self.raw[i]
+            counts[node] += 1
+        self.nodes = sums / counts[:, None]
+        self.raw_index = {}
+        k = 0
+        for ci, c in enumerate(self.contours):
+            for vi in range(len(c.points)):
+                self.raw_index[(ci, vi)] = k
+                k += 1
+
+    def build_edges(self) -> None:
+        self.edges: list[_Edge] = []
+        self.sequences = []  # per contorno: (nodi, bulge, src_index, closed, edge ids)
+        for ci, c in enumerate(self.contours):
+            nodes = [self.raw_node[self.raw_index[(ci, vi)]] for vi in range(len(c.points))]
+            bulges = list(c.bulges) + [0.0] * (len(nodes) - len(c.bulges))
+            src = list(range(len(nodes)))
+            closed = c.closed
+            if c.kind == "point":
+                self.sequences.append((nodes, bulges, src, False, []))
+                continue
+            changed = True
+            while changed and len(nodes) > 1:
+                changed = False
+                for i in range(len(nodes) - 1):
+                    if nodes[i] == nodes[i + 1]:
+                        del nodes[i], bulges[i], src[i]
+                        self.report.removed_micro_segments += 1
+                        changed = True
+                        break
+                if c.kind == "polyline" and len(nodes) > 1 and nodes[0] == nodes[-1]:
+                    if closed:
+                        self.report.removed_micro_segments += 1
+                    else:
+                        closed = True  # polilinea "chiusa a vista" ma aperta: la chiudo
+                    del nodes[-1], bulges[-1], src[-1]
+                    changed = True
+            if len(nodes) < 2:
+                self.sequences.append((nodes, bulges, src, closed, None))
+                continue
+            edge_ids = []
+            nseg = len(nodes) if closed else len(nodes) - 1
+            for i in range(nseg):
+                a, b = nodes[i], nodes[(i + 1) % len(nodes)]
+                bulge = bulges[i]
+                va = self.nodes[a]
+                vb = self.nodes[b]
+                chord = float(np.hypot(*(vb - va)))
+                if bulge and c.kind != "arc" and abs(bulge) * chord / 2 < self.p.lin_tol / 2:
+                    bulge = 0.0
+                    bulges[i] = 0.0
+                    self.report.straightened_bulges += 1
+                e = _Edge(a, b, bulge, ci, is_line=(bulge == 0.0), length=chord,
+                          angle=math.atan2(vb[1] - va[1], vb[0] - va[0]))
+                edge_ids.append(len(self.edges))
+                self.edges.append(e)
+            self.sequences.append((nodes, bulges, src, closed, edge_ids))
+        # aperture chiuse: nodi nati da punti non coincidenti
+        gaps = {self.raw_node[k] for k in range(len(self.raw_node))
+                if np.any(self.raw[k] != self.nodes[self.raw_node[k]])}
+        self.report.merged_gaps = len(gaps)
+
+    # -- 2. direzioni -------------------------------------------------------
+    def cluster_directions(self) -> None:
+        lines = sorted((i for i, e in enumerate(self.edges) if e.is_line),
+                       key=lambda i: -self.edges[i].length)
+        groups: list[_DirGroup] = []
+        for i in lines:
+            e = self.edges[i]
+            theta = e.angle % math.pi
+            best, best_d = None, None
+            for gi, g in enumerate(groups):
+                d = _undirected_dist(theta, math.radians(g.angle))
+                if best_d is None or d < best_d:
+                    best, best_d = gi, d
+            if best is None or not self._within(best_d, e.length):
+                groups.append(_DirGroup(angle=math.degrees(theta) % 180.0))
+                best = len(groups) - 1
+            g = groups[best]
+            g.members.append(i)
+            g.sx += e.length * math.cos(2 * theta)
+            g.sy += e.length * math.sin(2 * theta)
+            g.angle = math.degrees(math.atan2(g.sy, g.sx) / 2) % 180.0
+            g.lmax = max(g.lmax, e.length)
+            g.total += e.length
+            e.group = best
+
+        # aggancio alla griglia angolare (0° e 90° sempre)
+        step = self.p.angle_step
+        for g in groups:
+            candidates = [0.0, 90.0, 180.0]
+            if step > 0:
+                k = round(g.angle / step)
+                candidates += [(k - 1) * step, k * step, (k + 1) * step]
+            target = min(candidates, key=lambda c: abs(g.angle - c))
+            d = math.radians(abs(g.angle - target))
+            if self._within(d, g.lmax):
+                g.angle = target % 180.0
+                g.fixed = True
+
+        # ortogonalità fra gruppi non agganciati alla griglia
+        for g in sorted(groups, key=lambda g: -g.total):
+            if g.fixed:
+                continue
+            for ref in sorted((r for r in groups if r.fixed), key=lambda r: -r.total):
+                target = (ref.angle + 90.0) % 180.0
+                d = _undirected_dist(math.radians(g.angle), math.radians(target))
+                if self._within(d, g.lmax):
+                    g.angle = target
+                    self.report.perpendicular_groups += 1
+                    break
+            g.fixed = True
+
+        self.groups = groups
+        self.report.direction_groups = len({round(g.angle, 9) for g in groups})
+        for e in (self.edges[i] for i in lines):
+            d = _undirected_dist(e.angle, math.radians(groups[e.group].angle))
+            if d > 1e-12:
+                self.report.snapped_lines += 1
+                self.report.max_line_deviation_deg = max(
+                    self.report.max_line_deviation_deg, math.degrees(d))
+                if d > math.radians(1e-6):
+                    self.report.details.append(
+                        f"entità {self.contours[e.contour].key}: segmento lungo {e.length:.4f} mm "
+                        f"a {math.degrees(e.angle) % 180:.6f}° -> {groups[e.group].angle:.6f}° "
+                        f"(errore {math.degrees(d):.6f}°)")
+
+    # -- 3. tangenze --------------------------------------------------------
+    def _alpha(self, e: _Edge) -> float:
+        return 4 * math.atan(e.bulge)
+
+    def _out_tangent(self, ei: int, end: int) -> float:
+        """Direzione uscente dal nodo lungo l'entità (radianti)."""
+        e = self.edges[ei]
+        half = 0.0 if e.is_line else self._alpha(e) / 2
+        if end == 0:
+            return e.angle - half
+        return e.angle + half + math.pi
+
+    def tangencies(self) -> None:
+        ends: dict[int, list[tuple[int, int]]] = {}
+        for ei, e in enumerate(self.edges):
+            ends.setdefault(e.a, []).append((ei, 0))
+            ends.setdefault(e.b, []).append((ei, 1))
+        link: dict[tuple[int, int], tuple[int, int]] = {}
+        tol = math.radians(self.p.tangent_tol)
+        for node, lst in ends.items():
+            if len(lst) != 2 or lst[0][0] == lst[1][0]:
+                continue
+            (e1, s1), (e2, s2) = lst
+            if self.edges[e1].is_line and self.edges[e2].is_line:
+                continue
+            diff = abs(_wrap_pi(self._out_tangent(e1, s1) - self._out_tangent(e2, s2) - math.pi))
+            if diff <= tol:
+                link[(e1, s1)] = (e2, s2)
+                link[(e2, s2)] = (e1, s1)
+
+        visited: set[int] = set()
+        for start in range(len(self.edges)):
+            if start in visited or ((start, 0) not in link and (start, 1) not in link):
+                continue
+            # risale all'inizio della catena (o riconosce un anello)
+            cur, rev, cyclic = start, False, False
+            while True:
+                entry = 1 if rev else 0
+                prev = link.get((cur, entry))
+                if prev is None:
+                    break
+                cur, rev = prev[0], prev[1] == 0
+                if cur == start:
+                    cyclic = True
+                    break
+            chain = []
+            while True:
+                chain.append((cur, rev))
+                visited.add(cur)
+                nxt = link.get((cur, 0 if rev else 1))
+                if nxt is None:
+                    break
+                cur, rev = nxt[0], nxt[1] == 1
+                if cur == chain[0][0]:
+                    cyclic = True
+                    break
+            self._solve_chain(chain, cyclic)
+
+    def _travel_dir(self, ei: int, rev: bool) -> float:
+        e = self.edges[ei]
+        travel = e.angle + (math.pi if rev else 0.0)
+        a = math.radians(self.groups[e.group].angle)
+        return a if abs(_wrap_pi(travel - a)) <= math.pi / 2 else a + math.pi
+
+    def _solve_chain(self, chain: list[tuple[int, bool]], cyclic: bool) -> None:
+        anchors = [k for k, (ei, _) in enumerate(chain) if self.edges[ei].is_line]
+        if not anchors:
+            return
+        alpha0 = {k: self._alpha(self.edges[ei]) * (-1 if rev else 1)
+                  for k, (ei, rev) in enumerate(chain) if not self.edges[ei].is_line}
+        result: dict[int, tuple[float, float]] = {}  # k -> (alpha, psi) nel verso di percorrenza
+        n = len(chain)
+
+        spans = list(zip(anchors, anchors[1:]))
+        if cyclic:
+            spans.append((anchors[-1], anchors[0] + n))
+        for i, j in spans:
+            arcs = [k % n for k in range(i + 1, j)]
+            if not arcs:
+                continue
+            t_i = self._travel_dir(*chain[i])
+            t_j = self._travel_dir(*chain[j % n])
+            s0 = sum(alpha0[k] for k in arcs)
+            delta = s0 + _wrap_pi(t_j - t_i - s0)
+            corr = delta - s0
+            if abs(corr) > 2 * math.radians(self.p.tangent_tol):
+                continue
+            weight = sum(abs(alpha0[k]) for k in arcs) or 1.0
+            t = t_i
+            for k in arcs:
+                alpha = alpha0[k] + corr * abs(alpha0[k]) / weight
+                result[k] = (alpha, t + alpha / 2)
+                t += alpha
+        if not cyclic:
+            t = self._travel_dir(*chain[anchors[-1]])
+            for k in range(anchors[-1] + 1, n):
+                result[k] = (alpha0[k], t + alpha0[k] / 2)
+                t += alpha0[k]
+            t = self._travel_dir(*chain[anchors[0]])
+            for k in range(anchors[0] - 1, -1, -1):
+                result[k] = (alpha0[k], t - alpha0[k] / 2)
+                t -= alpha0[k]
+
+        for k, (alpha, psi) in result.items():
+            ei, rev = chain[k]
+            e = self.edges[ei]
+            e.new_bulge = math.tan(alpha / 4) * (-1 if rev else 1)
+            e.chord_normal = (-math.sin(psi), math.cos(psi))
+            self.report.tangent_arcs += 1
+
+    # -- 4/5. vincoli e risoluzione -----------------------------------------
+    def build_constraints(self) -> None:
+        rows: list[list[tuple[int, float]]] = []
+
+        def diff_row(normal, a, b):
+            nx, ny = normal
+            row = []
+            if nx:
+                row += [(2 * b, nx), (2 * a, -nx)]
+            if ny:
+                row += [(2 * b + 1, ny), (2 * a + 1, -ny)]
+            rows.append(row)
+
+        for e in self.edges:
+            if e.is_line:
+                diff_row(_normal(self.groups[e.group].angle), e.a, e.b)
+            elif e.chord_normal is not None:
+                diff_row(e.chord_normal, e.a, e.b)
+
+        # collinearità: segmenti con la stessa direzione e offset quasi uguale
+        by_angle: dict[float, list[int]] = {}
+        for i, e in enumerate(self.edges):
+            if e.is_line:
+                by_angle.setdefault(round(self.groups[e.group].angle, 9), []).append(i)
+        for angle, members in by_angle.items():
+            n = _normal(angle)
+            offsets = []
+            for i in members:
+                e = self.edges[i]
+                mid = (self.nodes[e.a] + self.nodes[e.b]) / 2
+                offsets.append((n[0] * mid[0] + n[1] * mid[1], i))
+            for grp in _cluster_1d(offsets, self.p.lin_tol):
+                ref = self.edges[grp[0]].a
+                nodes_in = {self.edges[i].a for i in grp} | {self.edges[i].b for i in grp}
+                if len(nodes_in) > 2:
+                    self.report.collinear_groups += 1
+                for i in grp[1:]:
+                    if self.edges[i].a != ref:
+                        diff_row(n, ref, self.edges[i].a)
+
+        # allineamento verticale/orizzontale dei vertici
+        if self.p.align_vertices:
+            adjacent = {(min(e.a, e.b), max(e.a, e.b)) for e in self.edges}
+            used = sorted({e.a for e in self.edges} | {e.b for e in self.edges}
+                          | {s[0][0] for s in self.sequences if s[4] == [] and s[0]})
+            for axis in (0, 1):
+                values = [(self.nodes[i][axis], i) for i in used]
+                for grp in _cluster_1d(values, self.p.lin_tol):
+                    spread = max(self.nodes[i][axis] for i in grp) - min(self.nodes[i][axis] for i in grp)
+                    if spread > 0:
+                        self.report.aligned_vertex_groups += 1
+                    linked = [grp[0]]
+                    for i in grp[1:]:
+                        ref = next((r for r in linked if (min(r, i), max(r, i)) not in adjacent), None)
+                        if ref is not None:
+                            rows.append([(2 * i + axis, 1.0), (2 * ref + axis, -1.0)])
+                            linked.append(i)
+        self.rows = rows
+
+    def solve(self) -> np.ndarray:
+        nvar = 2 * len(self.nodes)
+        v = self.nodes.reshape(-1).copy()
+        if not self.rows:
+            return v
+        data, ri, ci = [], [], []
+        for r, row in enumerate(self.rows):
+            for c, val in row:
+                ri.append(r)
+                ci.append(c)
+                data.append(val)
+        A = csr_matrix((data, (ri, ci)), shape=(len(self.rows), nvar))
+        for _ in range(4):
+            r = -(A @ v)
+            if np.max(np.abs(r)) < 1e-13:
+                break
+            dv = lsqr(A, r, atol=1e-16, btol=1e-16, conlim=1e12, iter_lim=50 * nvar + 1000)[0]
+            v = v + dv
+
+        # uguaglianze esatte per gli assi (orizzontali/verticali "bit per bit")
+        uf = _UnionFind(nvar)
+        for row in self.rows:
+            if len(row) == 2 and row[0][1] == -row[1][1] and row[0][0] % 2 == row[1][0] % 2:
+                uf.union(row[0][0], row[1][0])
+        groups: dict[int, list[int]] = {}
+        for i in range(nvar):
+            groups.setdefault(uf.find(i), []).append(i)
+        for members in groups.values():
+            if len(members) > 1:
+                v[members] = float(np.mean(v[members]))
+        self.report.residual = float(np.max(np.abs(A @ v)))
+        return v
+
+    # -- esecuzione completa ------------------------------------------------
+    def run(self) -> list[FixedContour]:
+        self.build_nodes()
+        self.build_edges()
+        self.cluster_directions()
+        self.tangencies()
+        self.build_constraints()
+        v = self.solve().reshape(-1, 2)
+
+        moves = np.hypot(*(v[self.raw_node] - self.raw).T) if len(self.raw) else np.zeros(0)
+        self.report.max_displacement = float(moves.max()) if len(moves) else 0.0
+        if self.report.residual > 1e-7:
+            self.report.warnings.append(
+                f"vincoli non completamente soddisfatti (residuo {self.report.residual:.2e})")
+        if self.report.max_displacement > self.p.move_limit:
+            worst = int(np.argmax(moves))
+            self.report.warnings.append(
+                f"un vertice si sposterebbe di {self.report.max_displacement:.4f} mm "
+                f"(limite {self.p.move_limit} mm), vicino a ({self.raw[worst][0]:.4f}, "
+                f"{self.raw[worst][1]:.4f}): probabile vincolo errato, controllare il disegno")
+
+        out = []
+        for ci, (nodes, bulges, src, closed, edge_ids) in enumerate(self.sequences):
+            c = self.contours[ci]
+            if edge_ids is None:
+                out.append(FixedContour(c.key, [], [], closed, [], deleted=True))
+                continue
+            new_bulges = list(bulges)
+            for k, ei in enumerate(edge_ids):
+                e = self.edges[ei]
+                new_bulges[k] = 0.0 if e.is_line else (
+                    e.new_bulge if e.new_bulge is not None else e.bulge)
+            pts = [(float(v[n][0]), float(v[n][1])) for n in nodes]
+            out.append(FixedContour(c.key, pts, new_bulges, closed, src))
+        return out
+
+
+def fix_contours(contours: list[Contour], params: Params | None = None
+                 ) -> tuple[list[FixedContour], Report]:
+    """Corregge i contorni e restituisce (contorni corretti, report).
+
+    I contorni restituiti sono nello stesso ordine di quelli in ingresso.
+    """
+    fixer = _Fixer(contours, params or Params())
+    fixed = fixer.run()
+    return fixed, fixer.report
