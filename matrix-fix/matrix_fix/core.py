@@ -28,7 +28,7 @@ import math
 from dataclasses import dataclass, field
 
 import numpy as np
-from scipy.sparse import csr_matrix
+from scipy.sparse import csr_matrix, diags
 from scipy.sparse.linalg import lsqr
 from scipy.spatial import cKDTree
 
@@ -90,11 +90,13 @@ class Report:
     tangent_arcs: int = 0
     collinear_groups: int = 0
     aligned_vertex_groups: int = 0
+    skipped_constraints: int = 0
     max_line_deviation_deg: float = 0.0
     max_displacement: float = 0.0
     residual: float = 0.0
     details: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
+    notes: list[str] = field(default_factory=list)
 
     def summary(self) -> str:
         rows = [
@@ -107,6 +109,7 @@ class Report:
             ("Archi resi tangenti", self.tangent_arcs),
             ("Gruppi di segmenti resi collineari", self.collinear_groups),
             ("Gruppi di vertici allineati", self.aligned_vertex_groups),
+            ("Vincoli facoltativi scartati", self.skipped_constraints),
             ("Errore angolare massimo trovato [°]", f"{self.max_line_deviation_deg:.6f}"),
             ("Spostamento massimo di un vertice [mm]", f"{self.max_displacement:.6f}"),
             ("Residuo dei vincoli dopo la correzione", f"{self.residual:.2e}"),
@@ -184,6 +187,7 @@ class _Edge:
     length: float = 0.0
     angle: float = 0.0  # direzione della corda A->B, radianti
     group: int = -1  # gruppo di direzione (solo segmenti)
+    deviation: float = 0.0  # scarto dalla direzione corretta, radianti
     new_bulge: float | None = None
     chord_normal: tuple[float, float] | None = None
 
@@ -320,6 +324,17 @@ class _Fixer:
             g.total += e.length
             e.group = best
 
+        # angolo di progetto: se un segmento del gruppo ha già un angolo "tondo"
+        # esatto (multiplo di 0.01°), quello è il valore voluto, non la media
+        for g in groups:
+            for i in g.members:  # già ordinati dal più lungo
+                deg = math.degrees(self.edges[i].angle) % 180.0
+                exact = round(deg * 100) / 100
+                if abs(deg - exact) < 1e-7:
+                    g.angle = exact % 180.0
+                    g.fixed = True
+                    break
+
         # aggancio alla griglia angolare (0° e 90° sempre)
         step = self.p.angle_step
         for g in groups:
@@ -350,6 +365,7 @@ class _Fixer:
         self.report.direction_groups = len({round(g.angle, 9) for g in groups})
         for e in (self.edges[i] for i in lines):
             d = _undirected_dist(e.angle, math.radians(groups[e.group].angle))
+            e.deviation = d
             if d > 1e-12:
                 self.report.snapped_lines += 1
                 self.report.max_line_deviation_deg = max(
@@ -472,7 +488,11 @@ class _Fixer:
 
     # -- 4/5. vincoli e risoluzione -----------------------------------------
     def build_constraints(self) -> None:
+        # ogni riga ha un'etichetta: None = vincolo essenziale (direzioni, tangenze),
+        # altrimenti descrive un vincolo facoltativo (collinearità, allineamento)
         rows: list[list[tuple[int, float]]] = []
+        tags: list[str | None] = []
+        tag: str | None = None
 
         def diff_row(normal, a, b):
             nx, ny = normal
@@ -482,6 +502,10 @@ class _Fixer:
             if ny:
                 row += [(2 * b + 1, ny), (2 * a + 1, -ny)]
             rows.append(row)
+            tags.append(tag)
+
+        def where(node):
+            return f"({self.nodes[node][0]:.4f}, {self.nodes[node][1]:.4f})"
 
         for e in self.edges:
             if e.is_line:
@@ -506,51 +530,79 @@ class _Fixer:
                 nodes_in = {self.edges[i].a for i in grp} | {self.edges[i].b for i in grp}
                 if len(nodes_in) > 2:
                     self.report.collinear_groups += 1
+                tag = f"collinearità a {angle:g}° vicino a {where(ref)}"
                 for i in grp[1:]:
                     if self.edges[i].a != ref:
                         diff_row(n, ref, self.edges[i].a)
+                tag = None
 
-        # allineamento verticale/orizzontale dei vertici
+        # allineamento verticale/orizzontale di spigoli fra segmenti e centri di fori;
+        # gli estremi degli archi sono esclusi: la loro posizione la decide la tangenza
         if self.p.align_vertices:
             adjacent = {(min(e.a, e.b), max(e.a, e.b)) for e in self.edges}
-            used = sorted({e.a for e in self.edges} | {e.b for e in self.edges}
-                          | {s[0][0] for s in self.sequences if s[4] == [] and s[0]})
+            on_arc = {n for e in self.edges if not e.is_line for n in (e.a, e.b)}
+            used = sorted(({e.a for e in self.edges} | {e.b for e in self.edges}
+                           | {s[0][0] for s in self.sequences if s[4] == [] and s[0]}) - on_arc)
             for axis in (0, 1):
                 values = [(self.nodes[i][axis], i) for i in used]
                 for grp in _cluster_1d(values, self.p.lin_tol):
                     spread = max(self.nodes[i][axis] for i in grp) - min(self.nodes[i][axis] for i in grp)
                     if spread > 0:
                         self.report.aligned_vertex_groups += 1
+                    tag = f"allineamento in {'XY'[axis]} di {', '.join(where(i) for i in grp)}"
                     linked = [grp[0]]
                     for i in grp[1:]:
                         ref = next((r for r in linked if (min(r, i), max(r, i)) not in adjacent), None)
                         if ref is not None:
                             rows.append([(2 * i + axis, 1.0), (2 * ref + axis, -1.0)])
+                            tags.append(tag)
                             linked.append(i)
+                    tag = None
         self.rows = rows
+        self.tags = tags
 
-    def solve(self) -> np.ndarray:
+    def _max_move(self, v: np.ndarray) -> float:
+        if not len(self.raw):
+            return 0.0
+        return float(np.hypot(*(v.reshape(-1, 2)[self.raw_node] - self.raw).T).max())
+
+    def solve(self, rows: list[list[tuple[int, float]]]) -> tuple[np.ndarray, float]:
+        """Spostamento minimo che soddisfa ``rows``; restituisce (coordinate, residuo)."""
         nvar = 2 * len(self.nodes)
         v = self.nodes.reshape(-1).copy()
-        if not self.rows:
-            return v
+        if not rows:
+            return v, 0.0
         data, ri, ci = [], [], []
-        for r, row in enumerate(self.rows):
+        for r, row in enumerate(rows):
             for c, val in row:
                 ri.append(r)
                 ci.append(c)
                 data.append(val)
-        A = csr_matrix((data, (ri, ci)), shape=(len(self.rows), nvar))
+        # i vertici fra segmenti già esatti sono "fidati": spostarli costa molto di
+        # più, così la correzione si scarica sulle linee davvero sbagliate
+        # (minimi quadrati pesati: colonne scalate di 1/sqrt(peso))
+        scale = np.ones(nvar)
+        exact: dict[int, bool] = {}
+        for e in self.edges:
+            if e.is_line:
+                for n in (e.a, e.b):
+                    exact[n] = exact.get(n, True) and e.deviation < 1e-11
+        for n, ok in exact.items():
+            if ok:
+                scale[2 * n:2 * n + 2] = 1e-3
+        A = csr_matrix((data, (ri, ci)), shape=(len(rows), nvar))
+        As = A @ diags(scale)
         for _ in range(4):
             r = -(A @ v)
             if np.max(np.abs(r)) < 1e-13:
                 break
-            dv = lsqr(A, r, atol=1e-16, btol=1e-16, conlim=1e12, iter_lim=50 * nvar + 1000)[0]
+            dv = scale * lsqr(As, r, atol=1e-16, btol=1e-16, conlim=1e12,
+                              iter_lim=50 * nvar + 1000)[0]
             v = v + dv
 
         # uguaglianze esatte per gli assi (orizzontali/verticali "bit per bit")
         uf = _UnionFind(nvar)
-        for row in self.rows:
+        for row in rows:
             if len(row) == 2 and row[0][1] == -row[1][1] and row[0][0] % 2 == row[1][0] % 2:
                 uf.union(row[0][0], row[1][0])
         groups: dict[int, list[int]] = {}
@@ -559,7 +611,47 @@ class _Fixer:
         for members in groups.values():
             if len(members) > 1:
                 v[members] = float(np.mean(v[members]))
-        self.report.residual = float(np.max(np.abs(A @ v)))
+        return v, float(np.max(np.abs(A @ v)))
+
+    def solve_with_fallback(self) -> np.ndarray:
+        """Risolve tutto; se un vincolo facoltativo costringe a spostamenti oltre
+        ``max_move`` lo scarta (ricerca per bisezione) e lo segnala."""
+        limit = self.p.move_limit
+        v, res = self.solve(self.rows)
+        if self._max_move(v) <= limit:
+            self.report.residual = res
+            return v
+        core = [r for r, t in zip(self.rows, self.tags) if t is None]
+        optional: dict[str, list] = {}
+        for r, t in zip(self.rows, self.tags):
+            if t is not None:
+                optional.setdefault(t, []).append(r)
+        v, res = self.solve(core)
+        if self._max_move(v) > limit or not optional:
+            self.report.residual = res
+            return v
+        kept: list = []
+
+        def try_add(batch: list[str]) -> None:
+            nonlocal v, res
+            if not batch:
+                return
+            cand = kept + [r for t in batch for r in optional[t]]
+            v2, res2 = self.solve(core + cand)
+            if self._max_move(v2) <= limit:
+                kept[:] = cand
+                v, res = v2, res2
+            elif len(batch) == 1:
+                self.report.notes.append(
+                    f"vincolo facoltativo non applicato ({batch[0]}): richiederebbe "
+                    f"spostamenti di {self._max_move(v2):.4f} mm")
+            else:
+                try_add(batch[: len(batch) // 2])
+                try_add(batch[len(batch) // 2:])
+
+        try_add(list(optional))
+        self.report.skipped_constraints = len(self.report.notes)
+        self.report.residual = res
         return v
 
     # -- esecuzione completa ------------------------------------------------
@@ -569,7 +661,7 @@ class _Fixer:
         self.cluster_directions()
         self.tangencies()
         self.build_constraints()
-        v = self.solve().reshape(-1, 2)
+        v = self.solve_with_fallback().reshape(-1, 2)
 
         moves = np.hypot(*(v[self.raw_node] - self.raw).T) if len(self.raw) else np.zeros(0)
         self.report.max_displacement = float(moves.max()) if len(moves) else 0.0

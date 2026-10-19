@@ -28,33 +28,42 @@ Errori corretti (tutti nell'ordine dei centesimi/millesimi di mm o di grado):
    **oppure** se lo spostamento laterale che produce (`lunghezza × sin(scarto)`) è
    ≤ `lin-tol` (con un tetto di `max-angle`). Questo secondo criterio è
    importante: un errore di 0,01 mm su un segmento corto di 0,5 mm vale più di 1°,
-   mentre su un lato di 50 mm vale 0,01°. Ogni gruppo prende la direzione media
-   pesata sulle lunghezze, poi viene agganciato a 0°/90°/griglia se vicino, e i
+   mentre su un lato di 50 mm vale 0,01°. Ogni gruppo prende l'angolo "di progetto" se una sua linea ce l'ha già
+   esatto (es. 13,000°), altrimenti la direzione media pesata sulle lunghezze; poi viene agganciato a 0°/90°/griglia se vicino, e i
    gruppi restanti vengono resi ortogonali a quelli già fissati se ci sono vicini.
 3. **Tangenze** – in ogni giunzione arco/segmento (o arco/arco) quasi tangente
    (≤ `tangent-tol`), si percorre la catena di entità tangenti: fra due segmenti
    di direzione ormai esatta la somma degli angoli al centro degli archi deve
    essere uguale alla rotazione fra le due direzioni; la piccola differenza viene
    ripartita sugli archi e da qui si ricava la direzione esatta di ogni corda.
+   L'allineamento dei vertici riguarda solo spigoli fra segmenti e centri dei
+   fori: gli estremi dei raccordi sono esclusi (li posiziona la tangenza).
 4. **Vincoli lineari** – fissate le direzioni, ogni condizione diventa un'equazione
    *lineare* nelle coordinate dei vertici, ad esempio per un segmento A→B di
    direzione con normale `n`: `n · (B − A) = 0`; per due segmenti collineari:
    `n · (A₂ − A₁) = 0`; per due vertici allineati in verticale: `x₁ − x₂ = 0`.
 5. **Minimo spostamento** – si risolve il sistema cercando lo spostamento di
    norma minima dei vertici (minimi quadrati vincolati, `scipy lsqr`): il disegno
-   si muove solo di quanto serve, tipicamente pochi micron. Le uguaglianze su X/Y
+   si muove solo di quanto serve, tipicamente pochi micron. I vertici fra linee
+   già esatte pesano molto di più, così la correzione ricade sulle linee davvero
+   sbagliate e le quote già corrette (es. spessori di 1,200 mm) non cambiano. Le uguaglianze su X/Y
    vengono infine imposte bit per bit, così Inventor vede linee *esattamente*
    orizzontali/verticali.
 6. **Sicurezza** – se un vertice dovesse spostarsi più di `max-move`
    (default 5 × `lin-tol`) il file non viene scritto e viene segnalato il punto:
    vuol dire che un vincolo non è un micro-errore ma una scelta progettuale.
    Gli scarti oltre `max-angle` (es. un lato a 93°) non vengono toccati.
+   Se un vincolo facoltativo (collinearità, allineamento) richiederebbe
+   spostamenti eccessivi viene scartato e segnalato come NOTA.
 
 ## Installazione
 
 ```
 pip install -r requirements.txt
 ```
+
+In alternativa all'ODA File Converter, i DWG si possono convertire in DXF anche con
+`dwg2dxf` di [LibreDWG](https://github.com/LibreDWG/libredwg) (open source).
 
 Per leggere/scrivere direttamente i **DWG** serve l'[ODA File Converter](https://www.opendesign.com/guestfiles/oda_file_converter)
 (gratuito); in alternativa salvare il DWG come DXF da AutoCAD/DWG TrueView.

@@ -186,4 +186,45 @@ def test_dxf_roundtrip(tmp_path, dirty_contours):
     line_c = next(c for c in contours if c.kind == "line")
     assert line_c.points[0][0] == line_c.points[1][0]
     arc_e = next(e for e in out.modelspace() if e.dxftype() == "ARC")
-    assert abs(arc_e.dxf.start_angle % 360) < 1e-9
+    assert abs((arc_e.dxf.start_angle + 180) % 360 - 180) < 1e-9
+
+
+def test_exact_design_angle_wins_over_mean():
+    # lato lungo a 13° esatti (valore di progetto) e lato interno a 13.068°:
+    # il gruppo deve prendere 13°, non la media pesata
+    def seg(x, y, deg, length):
+        r = math.radians(deg)
+        return Contour(f"s{x}", [(x, y), (x + length * math.cos(r), y + length * math.sin(r))],
+                       [0, 0], kind="line")
+    fixed, report = fix_contours([seg(0, 0, 13.0, 36.6), seg(0, 5, 13.068474, 17.7)])
+    for fc in fixed:
+        (x0, y0), (x1, y1) = fc.points
+        assert abs(math.degrees(math.atan2(y1 - y0, x1 - x0)) - 13.0) < 1e-9
+    assert report.max_displacement < 0.02
+
+
+def test_coincidental_arc_endpoint_alignment_is_ignored():
+    # due raccordi diversi con estremi a X quasi uguale (0.6 micron) per caso:
+    # non devono essere forzati in colonna né bloccare la correzione
+    outer_pts, outer_b = fillet_polygon([(0, 0), (40, 0), (40, 20), (0, 20)], 3.0)
+    inner_pts, inner_b = fillet_polygon([(1.0006, 3), (37, 3), (37, 17), (1.0006, 17)], 2.0)
+    contours = [Contour("o", outer_pts, outer_b, closed=True),
+                Contour("i", inner_pts, inner_b, closed=True)]
+    fixed, report = fix_contours(contours)
+    assert not report.warnings
+    assert report.max_displacement < 1e-6
+
+
+def test_exact_geometry_is_not_moved():
+    # contorno esatto (spessore 1.2) + un lato interno storto di 0.05°:
+    # si deve muovere solo il lato storto, lo spessore 1.2 resta identico
+    r = math.radians(0.05)
+    outer = Contour("o", [(0, 0), (40, 0), (40, 20), (0, 20)], [0] * 4, closed=True)
+    inner = Contour("i", [(1.2, 1.2), (38.8, 1.2 + 37.6 * math.tan(r)), (38.8, 18.8), (1.2, 18.8)],
+                    [0] * 4, closed=True)  # fondo interno inclinato
+    fixed, report = fix_contours([outer, inner])
+    pts = fixed[1].points
+    assert fixed[0].points == outer.points  # contorno esatto intatto
+    assert [p[0] for p in pts] == [1.2, 38.8, 38.8, 1.2]  # spessori laterali 1.2 intatti
+    assert pts[2:] == [(38.8, 18.8), (1.2, 18.8)]  # lato superiore intatto
+    assert pts[0][1] == pts[1][1]  # fondo reso orizzontale

@@ -76,6 +76,8 @@ def main(argv: list[str] | None = None) -> int:
         if args.verbose:
             for line in report.details:
                 print("  -", line)
+        for note in report.notes:
+            print("NOTA:", note)
         for warning in report.warnings:
             print("ATTENZIONE:", warning)
         if report.warnings and not args.force:
