@@ -43,6 +43,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--layers", help="elabora solo questi layer (separati da virgola)")
     p.add_argument("--include-blocks", action="store_true",
                    help="corregge anche le definizioni di blocco (ognuna indipendente)")
+    p.add_argument("--oda", help="percorso di ODAFileConverter.exe (di solito trovato da solo)")
     p.add_argument("--check", action="store_true",
                    help="analizza e riporta gli errori senza scrivere il file")
     p.add_argument("--force", action="store_true",
@@ -60,6 +61,7 @@ def main(argv: list[str] | None = None) -> int:
                     wall_tol=args.wall_tol, max_wall=args.max_wall)
     layers = set(args.layers.split(",")) if args.layers else None
 
+    dxf_io.setup_oda(args.oda)
     try:
         doc = dxf_io.load(args.input)
     except Exception as exc:  # file illeggibile o ODA File Converter mancante

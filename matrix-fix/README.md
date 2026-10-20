@@ -68,6 +68,29 @@ Errori corretti (tutti nell'ordine dei centesimi/millesimi di mm o di grado):
    richiederebbe spostamenti eccessivi o contraddice gli altri, viene scartato e
    segnalato come NOTA (priorità: spessori, raggi, collinearità, allineamenti).
 
+## Uso su Windows (passo passo)
+
+1. **Python**: installa Python 3.11 o successivo da [python.org](https://www.python.org/downloads/)
+   spuntando *"Add python.exe to PATH"* nella prima schermata dell'installer.
+2. **ODA File Converter** (per leggere/scrivere i DWG): scaricalo gratis da
+   [opendesign.com](https://www.opendesign.com/guestfiles/oda_file_converter) e installalo
+   normalmente. Il programma lo trova da solo in `C:\Program Files\ODA\...`;
+   altrimenti si indica con `--oda "C:\percorso\ODAFileConverter.exe"`.
+3. **Codice**: scarica la cartella `matrix-fix` (da GitHub: branch
+   `claude/dwg-geometry-error-correction-7y1w4m` → *Code* → *Download ZIP*, oppure
+   `git clone -b claude/dwg-geometry-error-correction-7y1w4m https://github.com/alby2k/sky-remote-cli.git`).
+4. **Librerie**: apri il *Prompt dei comandi* nella cartella `matrix-fix` e lancia
+   una volta sola:
+   ```
+   python -m pip install -r requirements.txt
+   ```
+5. **Uso**: trascina il file `.dwg` sopra `matrix-fix.bat`, oppure dal prompt:
+   ```
+   python -m matrix_fix "C:\cartella\Matrice.dwg" --check -v   (solo analisi)
+   python -m matrix_fix "C:\cartella\Matrice.dwg" -v           (scrive Matrice_fix.dwg)
+   ```
+   Il file originale non viene mai modificato.
+
 ## Installazione
 
 ```

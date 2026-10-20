@@ -18,6 +18,24 @@ from .core import Contour, FixedContour
 SUPPORTED = {"LWPOLYLINE", "POLYLINE", "LINE", "ARC", "CIRCLE"}
 
 
+def setup_oda(exe: str | None = None) -> None:
+    """Indica a ezdxf dove si trova l'ODA File Converter.
+
+    Su Windows l'installer usa una cartella con la versione nel nome
+    (es. ``C:\\Program Files\\ODA\\ODAFileConverter 26.4.0``): se non viene
+    passato ``exe``, si prende la versione più recente trovata lì."""
+    import os
+    import platform
+    if exe is None and platform.system() == "Windows":
+        roots = [Path(os.environ.get(v, "")) / "ODA" for v in ("ProgramFiles", "ProgramFiles(x86)")]
+        found = sorted(p for r in roots if r.is_dir()
+                       for p in r.glob("ODAFileConverter*/ODAFileConverter.exe"))
+        exe = str(found[-1]) if found else None
+    if exe:
+        key = "win_exec_path" if platform.system() == "Windows" else "unix_exec_path"
+        ezdxf.options.set("odafc-addon", key, f'"{exe}"')
+
+
 def load(path: str | Path):
     path = Path(path)
     if path.suffix.lower() == ".dwg":
