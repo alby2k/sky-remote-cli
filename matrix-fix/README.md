@@ -14,7 +14,8 @@ Errori corretti (tutti nell'ordine dei centesimi/millesimi di mm o di grado):
 | Angoli quasi "tondi" (45°, 30°, 60°…) | agganciati alla griglia angolare (`--angle-step`, default 15°) |
 | Lati quasi allineati | segmenti paralleli con offset quasi uguale resi collineari |
 | Vertici quasi allineati | vertici/centri di fori con X (o Y) quasi uguale allineati |
-| Raccordi non perfettamente tangenti | angolo dell'arco e corda ricalcolati per tangenza esatta |
+| Raccordi non perfettamente tangenti | angolo dell'arco e corda ricalcolati per tangenza esatta, raggio di progetto conservato |
+| Spessori di parete "storti" (es. 1,567 mm) | portati al multiplo di 0,1 mm (`--wall-step`), costanti lungo la parete |
 | Contorni non chiusi, micro-aperture | vertici più vicini di `--merge-tol` fusi, polilinee chiuse |
 | Micro-segmenti, micro-archi | eliminati / raddrizzati |
 
@@ -38,23 +39,34 @@ Errori corretti (tutti nell'ordine dei centesimi/millesimi di mm o di grado):
    ripartita sugli archi e da qui si ricava la direzione esatta di ogni corda.
    L'allineamento dei vertici riguarda solo spigoli fra segmenti e centri dei
    fori: gli estremi dei raccordi sono esclusi (li posiziona la tangenza).
-4. **Vincoli lineari** – fissate le direzioni, ogni condizione diventa un'equazione
+   I raggi dei raccordi restano quelli di progetto (arrotondati al centesimo se
+   ci sono vicini): con direzione della corda nota, anche il raggio è un
+   vincolo lineare.
+4. **Spessori di parete** – due segmenti paralleli affacciati, con il pieno del
+   profilo in mezzo (verificato sui contorni chiusi) e nessun altro segmento fra
+   loro, sono una parete: la loro distanza viene portata al multiplo di
+   `--wall-step` (default 0,1 mm, le cartelle hanno al massimo un decimale) se lo
+   scarto è entro `--wall-tol`. Le cave/luci (vuoto in mezzo) non vengono toccate.
+5. **Vincoli lineari** – fissate le direzioni, ogni condizione diventa un'equazione
    *lineare* nelle coordinate dei vertici, ad esempio per un segmento A→B di
    direzione con normale `n`: `n · (B − A) = 0`; per due segmenti collineari:
    `n · (A₂ − A₁) = 0`; per due vertici allineati in verticale: `x₁ − x₂ = 0`.
-5. **Minimo spostamento** – si risolve il sistema cercando lo spostamento di
+6. **Minimo spostamento** – si risolve il sistema cercando lo spostamento di
    norma minima dei vertici (minimi quadrati vincolati, `scipy lsqr`): il disegno
    si muove solo di quanto serve, tipicamente pochi micron. I vertici fra linee
-   già esatte pesano molto di più, così la correzione ricade sulle linee davvero
-   sbagliate e le quote già corrette (es. spessori di 1,200 mm) non cambiano. Le uguaglianze su X/Y
+   già esatte (e fra raccordi rimasti invariati) pesano molto di più, così la
+   correzione ricade sulle linee davvero sbagliate e le quote già corrette
+   (es. spessori di 1,200 mm) non cambiano; ciò che si muoverebbe meno di
+   1e-9 mm resta identico all'originale. Le uguaglianze su X/Y
    vengono infine imposte bit per bit, così Inventor vede linee *esattamente*
    orizzontali/verticali.
-6. **Sicurezza** – se un vertice dovesse spostarsi più di `max-move`
+7. **Sicurezza** – se un vertice dovesse spostarsi più di `max-move`
    (default 5 × `lin-tol`) il file non viene scritto e viene segnalato il punto:
    vuol dire che un vincolo non è un micro-errore ma una scelta progettuale.
    Gli scarti oltre `max-angle` (es. un lato a 93°) non vengono toccati.
-   Se un vincolo facoltativo (collinearità, allineamento) richiederebbe
-   spostamenti eccessivi viene scartato e segnalato come NOTA.
+   Se un vincolo facoltativo (spessore, raggio, collinearità, allineamento)
+   richiederebbe spostamenti eccessivi o contraddice gli altri, viene scartato e
+   segnalato come NOTA (priorità: spessori, raggi, collinearità, allineamenti).
 
 ## Installazione
 
@@ -87,6 +99,9 @@ Opzioni principali:
 | `--tangent-tol` | 1.0° | oltre questo scarto una giunzione è uno spigolo vivo |
 | `--merge-tol` | = lin-tol | distanza di fusione dei vertici |
 | `--max-move` | 5 × lin-tol | spostamento massimo ammesso di un vertice |
+| `--wall-step` | 0.1 mm | gli spessori di parete sono multipli di questo; `0` = non toccarli |
+| `--wall-tol` | 0.049 mm | scarto massimo di uno spessore dal valore arrotondato |
+| `--max-wall` | 10 mm | oltre questa distanza due linee non sono una parete |
 | `--no-align-vertices` | | non allineare i vertici in X/Y |
 | `--layers A,B` | tutti | elabora solo alcuni layer |
 | `--include-blocks` | | corregge anche le definizioni di blocco |

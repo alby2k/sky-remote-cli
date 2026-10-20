@@ -43,6 +43,9 @@ class Params:
     merge_tol: float | None = None  # mm: default = lin_tol
     align_vertices: bool = True
     max_move: float | None = None  # mm: default = 5 * lin_tol
+    wall_step: float = 0.1  # mm: gli spessori di parete sono multipli di questo (0 = no)
+    wall_tol: float = 0.049  # mm: scarto massimo di uno spessore dal valore arrotondato
+    max_wall: float = 10.0  # mm: oltre questa distanza due linee non sono una parete
 
     @property
     def merge(self) -> float:
@@ -91,6 +94,9 @@ class Report:
     collinear_groups: int = 0
     aligned_vertex_groups: int = 0
     skipped_constraints: int = 0
+    walls: int = 0
+    walls_changed: int = 0
+    radii_kept: int = 0
     max_line_deviation_deg: float = 0.0
     max_displacement: float = 0.0
     residual: float = 0.0
@@ -109,6 +115,8 @@ class Report:
             ("Archi resi tangenti", self.tangent_arcs),
             ("Gruppi di segmenti resi collineari", self.collinear_groups),
             ("Gruppi di vertici allineati", self.aligned_vertex_groups),
+            ("Spessori di parete vincolati (di cui corretti)", f"{self.walls} ({self.walls_changed})"),
+            ("Raggi di raccordo conservati", self.radii_kept),
             ("Vincoli facoltativi scartati", self.skipped_constraints),
             ("Errore angolare massimo trovato [°]", f"{self.max_line_deviation_deg:.6f}"),
             ("Spostamento massimo di un vertice [mm]", f"{self.max_displacement:.6f}"),
@@ -189,7 +197,7 @@ class _Edge:
     group: int = -1  # gruppo di direzione (solo segmenti)
     deviation: float = 0.0  # scarto dalla direzione corretta, radianti
     new_bulge: float | None = None
-    chord_normal: tuple[float, float] | None = None
+    chord: tuple[int, int, float, float] | None = None  # (da, a, direzione, angolo) se tangente
 
 
 @dataclass
@@ -483,58 +491,167 @@ class _Fixer:
             ei, rev = chain[k]
             e = self.edges[ei]
             e.new_bulge = math.tan(alpha / 4) * (-1 if rev else 1)
-            e.chord_normal = (-math.sin(psi), math.cos(psi))
+            e.chord = (e.b, e.a, psi, alpha) if rev else (e.a, e.b, psi, alpha)
             self.report.tangent_arcs += 1
 
     # -- 4/5. vincoli e risoluzione -----------------------------------------
-    def build_constraints(self) -> None:
-        # ogni riga ha un'etichetta: None = vincolo essenziale (direzioni, tangenze),
-        # altrimenti descrive un vincolo facoltativo (collinearità, allineamento)
-        rows: list[list[tuple[int, float]]] = []
-        tags: list[str | None] = []
-        tag: str | None = None
+    def _material_test(self):
+        """Funzione punto -> True se il punto è nel pieno del profilo (regola pari/dispari
+        sui contorni chiusi). Senza contorni chiusi non si può sapere: sempre True."""
+        polys = []
+        for nodes, bulges, _src, closed, edge_ids in self.sequences:
+            if not closed or not edge_ids:
+                continue
+            pts = []
+            for k, ei in enumerate(edge_ids):
+                e = self.edges[ei]
+                pa = self.nodes[e.a]
+                pts.append(pa)
+                if not e.is_line:
+                    pb = self.nodes[e.b]
+                    chord = float(np.hypot(*(pb - pa)))
+                    u = (pb - pa) / chord
+                    b = e.bulge
+                    h = chord * (1 - b * b) / (4 * b)
+                    c = (pa + pb) / 2 + np.array([-u[1], u[0]]) * h
+                    a0 = math.atan2(pa[1] - c[1], pa[0] - c[0])
+                    alpha = 4 * math.atan(b)
+                    rad = float(np.hypot(*(pa - c)))
+                    for t in np.linspace(0, 1, 17)[1:-1]:
+                        a = a0 + alpha * t
+                        pts.append(c + rad * np.array([math.cos(a), math.sin(a)]))
+            polys.append(np.array(pts))
+        if not polys:
+            return lambda pt: True
 
-        def diff_row(normal, a, b):
+        def inside(pt) -> bool:
+            count = 0
+            for poly in polys:
+                x, y = poly[:, 0], poly[:, 1]
+                x2, y2 = np.roll(x, -1), np.roll(y, -1)
+                cross = (y > pt[1]) != (y2 > pt[1])
+                with np.errstate(divide="ignore", invalid="ignore"):
+                    xi = x + (pt[1] - y) * (x2 - x) / (y2 - y)
+                count += int(np.count_nonzero(cross & (pt[0] < xi)) % 2)
+            return count % 2 == 1
+        return inside
+
+    def build_constraints(self) -> None:
+        # ogni vincolo è (coefficienti, termine noto) con un'etichetta: None = vincolo
+        # essenziale (direzioni, tangenze), altrimenti descrive un vincolo facoltativo,
+        # che viene scartato se incompatibile; l'ordine delle liste è la priorità
+        self.radius_tags: dict[str, tuple[_Edge, float]] = {}
+        core: list = []
+        walls: list = []
+        radii: list = []
+        collinear: list = []
+        aligned: list = []
+
+        def diff_row(target, normal, a, b, rhs=0.0, tag=None):
             nx, ny = normal
             row = []
             if nx:
                 row += [(2 * b, nx), (2 * a, -nx)]
             if ny:
                 row += [(2 * b + 1, ny), (2 * a + 1, -ny)]
-            rows.append(row)
-            tags.append(tag)
+            target.append((row, rhs, tag))
 
         def where(node):
             return f"({self.nodes[node][0]:.4f}, {self.nodes[node][1]:.4f})"
 
         for e in self.edges:
             if e.is_line:
-                diff_row(_normal(self.groups[e.group].angle), e.a, e.b)
-            elif e.chord_normal is not None:
-                diff_row(e.chord_normal, e.a, e.b)
+                diff_row(core, _normal(self.groups[e.group].angle), e.a, e.b)
+            elif e.chord is not None:
+                p, q, psi, _alpha = e.chord
+                diff_row(core, (-math.sin(psi), math.cos(psi)), p, q)
 
-        # collinearità: segmenti con la stessa direzione e offset quasi uguale
+        # raggi: un arco con corda di direzione nota ha corda lineare nei nodi, quindi
+        # il raggio di progetto (arrotondato al centesimo se ci è vicino) si conserva
+        for e in self.edges:
+            if e.chord is None:
+                continue
+            p, q, psi, alpha = e.chord
+            r0 = e.length / (2 * abs(math.sin(2 * math.atan(e.bulge))))
+            r = round(r0, 2) if abs(r0 - round(r0, 2)) <= 1e-3 else r0
+            if abs(r - r0) > 1e-9:
+                self.report.details.append(f"raggio {r0:.6f} -> {r:.2f} vicino a {where(p)}")
+            self.report.radii_kept += 1
+            self.radius_tags[f"raggio R{r:g} vicino a {where(p)}"] = (e, r)
+            radii.append(([(2 * q, math.cos(psi)), (2 * p, -math.cos(psi)),
+                           (2 * q + 1, math.sin(psi)), (2 * p + 1, -math.sin(psi))],
+                          2 * r * abs(math.sin(alpha / 2)), f"raggio R{r:g} vicino a {where(p)}"))
+
         by_angle: dict[float, list[int]] = {}
         for i, e in enumerate(self.edges):
             if e.is_line:
                 by_angle.setdefault(round(self.groups[e.group].angle, 9), []).append(i)
+        in_material = self._material_test() if self.p.wall_step > 0 else None
         for angle, members in by_angle.items():
             n = _normal(angle)
-            offsets = []
+            u = (n[1], -n[0])
+            offset, span = {}, {}
             for i in members:
                 e = self.edges[i]
-                mid = (self.nodes[e.a] + self.nodes[e.b]) / 2
-                offsets.append((n[0] * mid[0] + n[1] * mid[1], i))
-            for grp in _cluster_1d(offsets, self.p.lin_tol):
+                pa, pb = self.nodes[e.a], self.nodes[e.b]
+                offset[i] = n[0] * (pa[0] + pb[0]) / 2 + n[1] * (pa[1] + pb[1]) / 2
+                sa, sb = u[0] * pa[0] + u[1] * pa[1], u[0] * pb[0] + u[1] * pb[1]
+                span[i] = (min(sa, sb), max(sa, sb))
+
+            # collinearità: segmenti con la stessa direzione e offset quasi uguale
+            uf = _UnionFind(len(self.edges))
+            for grp in _cluster_1d([(offset[i], i) for i in members], self.p.lin_tol):
                 ref = self.edges[grp[0]].a
                 nodes_in = {self.edges[i].a for i in grp} | {self.edges[i].b for i in grp}
                 if len(nodes_in) > 2:
                     self.report.collinear_groups += 1
                 tag = f"collinearità a {angle:g}° vicino a {where(ref)}"
                 for i in grp[1:]:
+                    uf.union(grp[0], i)
                     if self.edges[i].a != ref:
-                        diff_row(n, ref, self.edges[i].a)
-                tag = None
+                        diff_row(collinear, n, ref, self.edges[i].a, tag=tag)
+
+            # spessori di parete: due segmenti paralleli affacciati, con il pieno in
+            # mezzo e nessun altro segmento fra loro, distano un multiplo di wall_step
+            if in_material is None:
+                continue
+            step = self.p.wall_step
+            ordered = sorted(members, key=lambda i: offset[i])
+            pairs = []
+            for x, i in enumerate(ordered):
+                for y in range(x + 1, len(ordered)):
+                    j = ordered[y]
+                    d = offset[j] - offset[i]
+                    if d > self.p.max_wall:
+                        break
+                    if d <= self.p.lin_tol:
+                        continue
+                    lo, hi = max(span[i][0], span[j][0]), min(span[i][1], span[j][1])
+                    if hi - lo <= self.p.lin_tol:
+                        continue
+                    t = round(round(d / step) * step, 9)
+                    if t <= 0 or abs(d - t) > self.p.wall_tol:
+                        continue
+                    if any(offset[i] + self.p.lin_tol < offset[k] < offset[j] - self.p.lin_tol
+                           and min(hi, span[k][1]) - max(lo, span[k][0]) > 0
+                           for k in ordered[x + 1:y]):
+                        continue  # c'è un altro segmento in mezzo: non è una parete
+                    s_mid, o_mid = (lo + hi) / 2, (offset[i] + offset[j]) / 2
+                    if not in_material((u[0] * s_mid + n[0] * o_mid, u[1] * s_mid + n[1] * o_mid)):
+                        continue  # in mezzo c'è il vuoto (cava, luce): non è una parete
+                    pairs.append((d, i, j, t))
+            for d, i, j, t in sorted(pairs):
+                if uf.find(i) == uf.find(j):
+                    continue  # già legati: un secondo vincolo potrebbe contraddire il primo
+                uf.union(i, j)
+                a = self.edges[i].a
+                self.report.walls += 1
+                if abs(d - t) > 1e-9:
+                    self.report.walls_changed += 1
+                    self.report.details.append(
+                        f"spessore parete a {angle:g}° vicino a {where(a)}: {d:.6f} -> {t:g} mm")
+                diff_row(walls, n, a, self.edges[j].a, rhs=t,
+                         tag=f"spessore {t:g} mm a {angle:g}° vicino a {where(a)}")
 
         # allineamento verticale/orizzontale di spigoli fra segmenti e centri di fori;
         # gli estremi degli archi sono esclusi: la loro posizione la decide la tangenza
@@ -554,56 +671,68 @@ class _Fixer:
                     for i in grp[1:]:
                         ref = next((r for r in linked if (min(r, i), max(r, i)) not in adjacent), None)
                         if ref is not None:
-                            rows.append([(2 * i + axis, 1.0), (2 * ref + axis, -1.0)])
-                            tags.append(tag)
+                            aligned.append(([(2 * i + axis, 1.0), (2 * ref + axis, -1.0)], 0.0, tag))
                             linked.append(i)
-                    tag = None
-        self.rows = rows
-        self.tags = tags
+        self.constraints = core + walls + radii + collinear + aligned
+
+    def _unchanged(self, e: _Edge) -> bool:
+        if e.is_line:
+            return e.deviation < 1e-11
+        if e.chord is None:
+            return True
+        p, q, psi, _alpha = e.chord
+        orig = math.atan2(*(self.nodes[q] - self.nodes[p])[::-1])
+        return abs(e.new_bulge - e.bulge) < 1e-12 and abs(_wrap_pi(psi - orig)) < 1e-11
 
     def _max_move(self, v: np.ndarray) -> float:
         if not len(self.raw):
             return 0.0
         return float(np.hypot(*(v.reshape(-1, 2)[self.raw_node] - self.raw).T).max())
 
-    def solve(self, rows: list[list[tuple[int, float]]]) -> tuple[np.ndarray, float]:
-        """Spostamento minimo che soddisfa ``rows``; restituisce (coordinate, residuo)."""
+    def solve(self, cons: list) -> tuple[np.ndarray, float]:
+        """Spostamento minimo che soddisfa i vincoli; restituisce (coordinate, residuo)."""
         nvar = 2 * len(self.nodes)
         v = self.nodes.reshape(-1).copy()
-        if not rows:
+        if not cons:
             return v, 0.0
         data, ri, ci = [], [], []
-        for r, row in enumerate(rows):
+        for r, (row, _rhs, _tag) in enumerate(cons):
             for c, val in row:
                 ri.append(r)
                 ci.append(c)
                 data.append(val)
-        # i vertici fra segmenti già esatti sono "fidati": spostarli costa molto di
-        # più, così la correzione si scarica sulle linee davvero sbagliate
-        # (minimi quadrati pesati: colonne scalate di 1/sqrt(peso))
+        b = np.array([rhs for _row, rhs, _tag in cons])
+        # i vertici in cui arrivano solo entità rimaste invariate (segmenti già nella
+        # direzione esatta, archi con angolo e corda invariati) sono "fidati":
+        # spostarli costa molto di più, così la correzione si scarica sulle parti
+        # davvero sbagliate (minimi quadrati pesati: colonne scalate di 1/sqrt(peso))
         scale = np.ones(nvar)
         exact: dict[int, bool] = {}
         for e in self.edges:
-            if e.is_line:
-                for n in (e.a, e.b):
-                    exact[n] = exact.get(n, True) and e.deviation < 1e-11
+            for n in (e.a, e.b):
+                exact[n] = exact.get(n, True) and self._unchanged(e)
         for n, ok in exact.items():
             if ok:
-                scale[2 * n:2 * n + 2] = 1e-3
-        A = csr_matrix((data, (ri, ci)), shape=(len(rows), nvar))
+                scale[2 * n:2 * n + 2] = 1e-4
+        A = csr_matrix((data, (ri, ci)), shape=(len(cons), nvar))
         As = A @ diags(scale)
         for _ in range(4):
-            r = -(A @ v)
+            r = b - A @ v
             if np.max(np.abs(r)) < 1e-13:
                 break
             dv = scale * lsqr(As, r, atol=1e-16, btol=1e-16, conlim=1e12,
                               iter_lim=50 * nvar + 1000)[0]
             v = v + dv
+        # ciò che si è mosso meno di 1e-9 mm torna identico all'originale (bit per bit)
+        v0 = self.nodes.reshape(-1)
+        still = np.abs(v - v0) < 1e-9
+        v[still] = v0[still]
 
         # uguaglianze esatte per gli assi (orizzontali/verticali "bit per bit")
         uf = _UnionFind(nvar)
-        for row in rows:
-            if len(row) == 2 and row[0][1] == -row[1][1] and row[0][0] % 2 == row[1][0] % 2:
+        for row, rhs, _tag in cons:
+            if (rhs == 0.0 and len(row) == 2 and row[0][1] == -row[1][1]
+                    and row[0][0] % 2 == row[1][0] % 2):
                 uf.union(row[0][0], row[1][0])
         groups: dict[int, list[int]] = {}
         for i in range(nvar):
@@ -611,46 +740,67 @@ class _Fixer:
         for members in groups.values():
             if len(members) > 1:
                 v[members] = float(np.mean(v[members]))
-        return v, float(np.max(np.abs(A @ v)))
+        return v, float(np.max(np.abs(b - A @ v)))
 
     def solve_with_fallback(self) -> np.ndarray:
-        """Risolve tutto; se un vincolo facoltativo costringe a spostamenti oltre
-        ``max_move`` lo scarta (ricerca per bisezione) e lo segnala."""
+        """Risolve tutto; un vincolo facoltativo che costringe a spostamenti oltre
+        ``max_move`` o che contraddice gli altri viene scartato (ricerca per
+        bisezione, in ordine di priorità) e segnalato."""
         limit = self.p.move_limit
-        v, res = self.solve(self.rows)
-        if self._max_move(v) <= limit:
+
+        def ok(v, res):
+            return self._max_move(v) <= limit and res <= 1e-9
+
+        v, res = self.solve(self.constraints)
+        if ok(v, res):
             self.report.residual = res
             return v
-        core = [r for r, t in zip(self.rows, self.tags) if t is None]
+        core = [c for c in self.constraints if c[2] is None]
         optional: dict[str, list] = {}
-        for r, t in zip(self.rows, self.tags):
-            if t is not None:
-                optional.setdefault(t, []).append(r)
+        for c in self.constraints:
+            if c[2] is not None:
+                optional.setdefault(c[2], []).append(c)
         v, res = self.solve(core)
-        if self._max_move(v) > limit or not optional:
+        if not ok(v, res) or not optional:
             self.report.residual = res
             return v
         kept: list = []
+        dropped: list = []
 
         def try_add(batch: list[str]) -> None:
             nonlocal v, res
             if not batch:
                 return
-            cand = kept + [r for t in batch for r in optional[t]]
+            cand = kept + [c for t in batch for c in optional[t]]
             v2, res2 = self.solve(core + cand)
-            if self._max_move(v2) <= limit:
+            if ok(v2, res2):
                 kept[:] = cand
                 v, res = v2, res2
             elif len(batch) == 1:
-                self.report.notes.append(
-                    f"vincolo facoltativo non applicato ({batch[0]}): richiederebbe "
-                    f"spostamenti di {self._max_move(v2):.4f} mm")
+                dropped.append((batch[0], res2, self._max_move(v2)))
             else:
                 try_add(batch[: len(batch) // 2])
                 try_add(batch[len(batch) // 2:])
 
         try_add(list(optional))
-        self.report.skipped_constraints = len(self.report.notes)
+        nodes = v.reshape(-1, 2)
+        for tag, res2, move in dropped:
+            if tag in self.radius_tags:
+                # un raggio lasciato libero per far chiudere una catena di raccordi
+                # tutti a raggio fisso: se resta quasi uguale è solo arrotondamento
+                e, r = self.radius_tags[tag]
+                bulge = e.bulge if e.new_bulge is None else e.new_bulge
+                chord = float(np.hypot(*(nodes[e.b] - nodes[e.a])))
+                r_fin = chord / (2 * abs(math.sin(2 * math.atan(bulge))))
+                if abs(r_fin - r) < 1e-4:
+                    self.report.details.append(
+                        f"{tag}: lasciato a {r_fin:.7f} per chiudere la catena di raccordi "
+                        f"(scarto {abs(r_fin - r):.1e} mm)")
+                    continue
+            why = (f"richiederebbe spostamenti di {move:.4f} mm" if res2 <= 1e-9
+                   else "in conflitto con altri vincoli")
+            self.report.notes.append(f"vincolo facoltativo non applicato ({tag}): {why}")
+        self.report.skipped_constraints = len(dropped)
         self.report.residual = res
         return v
 

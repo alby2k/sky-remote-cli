@@ -31,6 +31,13 @@ def build_parser() -> argparse.ArgumentParser:
                    help="distanza sotto la quale due vertici vengono fusi (default = lin-tol)")
     p.add_argument("--max-move", type=float,
                    help="spostamento massimo ammesso di un vertice in mm (default 5 x lin-tol)")
+    p.add_argument("--wall-step", type=float, default=0.1,
+                   help="gli spessori di parete sono multipli di questo valore in mm; "
+                        "0 = non correggere gli spessori (default 0.1)")
+    p.add_argument("--wall-tol", type=float, default=0.049,
+                   help="scarto massimo di uno spessore dal valore arrotondato (default 0.049)")
+    p.add_argument("--max-wall", type=float, default=10.0,
+                   help="spessore massimo considerato parete, in mm (default 10)")
     p.add_argument("--no-align-vertices", action="store_true",
                    help="non allineare in X/Y i vertici quasi allineati")
     p.add_argument("--layers", help="elabora solo questi layer (separati da virgola)")
@@ -49,7 +56,8 @@ def main(argv: list[str] | None = None) -> int:
     params = Params(lin_tol=args.lin_tol, angle_tol=args.angle_tol, max_angle=args.max_angle,
                     angle_step=args.angle_step, tangent_tol=args.tangent_tol,
                     merge_tol=args.merge_tol, max_move=args.max_move,
-                    align_vertices=not args.no_align_vertices)
+                    align_vertices=not args.no_align_vertices, wall_step=args.wall_step,
+                    wall_tol=args.wall_tol, max_wall=args.max_wall)
     layers = set(args.layers.split(",")) if args.layers else None
 
     try:

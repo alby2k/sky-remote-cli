@@ -196,7 +196,8 @@ def test_exact_design_angle_wins_over_mean():
         r = math.radians(deg)
         return Contour(f"s{x}", [(x, y), (x + length * math.cos(r), y + length * math.sin(r))],
                        [0, 0], kind="line")
-    fixed, report = fix_contours([seg(0, 0, 13.0, 36.6), seg(0, 5, 13.068474, 17.7)])
+    fixed, report = fix_contours([seg(0, 0, 13.0, 36.6), seg(0, 5, 13.068474, 17.7)],
+                                 Params(wall_step=0))
     for fc in fixed:
         (x0, y0), (x1, y1) = fc.points
         assert abs(math.degrees(math.atan2(y1 - y0, x1 - x0)) - 13.0) < 1e-9
@@ -210,7 +211,7 @@ def test_coincidental_arc_endpoint_alignment_is_ignored():
     inner_pts, inner_b = fillet_polygon([(1.0006, 3), (37, 3), (37, 17), (1.0006, 17)], 2.0)
     contours = [Contour("o", outer_pts, outer_b, closed=True),
                 Contour("i", inner_pts, inner_b, closed=True)]
-    fixed, report = fix_contours(contours)
+    fixed, report = fix_contours(contours, Params(wall_step=0))
     assert not report.warnings
     assert report.max_displacement < 1e-6
 
@@ -228,3 +229,34 @@ def test_exact_geometry_is_not_moved():
     assert [p[0] for p in pts] == [1.2, 38.8, 38.8, 1.2]  # spessori laterali 1.2 intatti
     assert pts[2:] == [(38.8, 18.8), (1.2, 18.8)]  # lato superiore intatto
     assert pts[0][1] == pts[1][1]  # fondo reso orizzontale
+
+
+def test_wall_thickness_snapped_to_one_decimal_and_radii_kept():
+    # fondo inclinato a 13° spesso 1.6, con la linea interna disegnata storta
+    # (spessore da 1.6 a 1.62) e raccordi R0.5 esterni / R0.3 interni:
+    # lo spessore torna 1.6 costante e i raggi restano esattamente R0.5 / R0.3
+    a = math.radians(13)
+    t = 1.6
+    outer = [(0, 40 * math.tan(a)), (40, 0), (40, 20), (0, 20)]
+    inner_y = lambda x: (40 - x) * math.tan(a) + t / math.cos(a)
+    inner = [(1.2, inner_y(1.2) + 0.02), (38.8, inner_y(38.8)), (38.8, 18.8), (1.2, 18.8)]
+    o_pts, o_b = fillet_polygon(outer, 0.5)
+    i_pts, i_b = fillet_polygon(inner, 0.3)
+    fixed, report = fix_contours([Contour("o", o_pts, o_b, closed=True),
+                                  Contour("i", i_pts, i_b, closed=True)])
+    assert not report.warnings and not report.notes
+    assert report.walls_changed >= 1
+    o, i = fixed
+    n = (math.sin(a), math.cos(a))  # normale al fondo (direzione -13°)
+    off = lambda p: n[0] * p[0] + n[1] * p[1]
+    for p in i.points[1:3]:  # il segmento 1 è il fondo in entrambi i contorni
+        assert abs(off(p) - off(o.points[1]) - t) < 1e-9
+    # il contorno esterno era esatto: non si muove
+    assert all(math.dist(p, q) < 1e-12 for p, q in zip(o.points, o_pts))
+    for fc, r_expected in ((o, 0.5), (i, 0.3)):
+        pts, bs = fc.points, fc.bulges
+        for k, b in enumerate(bs):
+            if b:
+                (x0, y0), (x1, y1) = pts[k], pts[(k + 1) % len(pts)]
+                r = math.hypot(x1 - x0, y1 - y0) / (2 * abs(math.sin(2 * math.atan(b))))
+                assert abs(r - r_expected) < 1e-9
