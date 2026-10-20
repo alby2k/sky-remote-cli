@@ -15,7 +15,8 @@ Errori corretti (tutti nell'ordine dei centesimi/millesimi di mm o di grado):
 | Lati quasi allineati | segmenti paralleli con offset quasi uguale resi collineari |
 | Vertici quasi allineati | vertici/centri di fori con X (o Y) quasi uguale allineati |
 | Raccordi non perfettamente tangenti | angolo dell'arco e corda ricalcolati per tangenza esatta, raggio di progetto conservato |
-| Spessori di parete "storti" (es. 1,567 mm) | portati al multiplo di 0,1 mm (`--wall-step`), costanti lungo la parete |
+| Spessori cartella "storti" (es. 1,567 mm) | linee parallele a ≤ 4 mm portate a distanza multipla di 0,1 mm, costante |
+| Quote orizzontali/verticali non al decimo (es. 7,954) | tutte le distanze fra linee orizzontali (e fra verticali) portate al decimo |
 | Contorni non chiusi, micro-aperture | vertici più vicini di `--merge-tol` fusi, polilinee chiuse |
 | Micro-segmenti, micro-archi | eliminati / raddrizzati |
 
@@ -29,9 +30,12 @@ Errori corretti (tutti nell'ordine dei centesimi/millesimi di mm o di grado):
    **oppure** se lo spostamento laterale che produce (`lunghezza × sin(scarto)`) è
    ≤ `lin-tol` (con un tetto di `max-angle`). Questo secondo criterio è
    importante: un errore di 0,01 mm su un segmento corto di 0,5 mm vale più di 1°,
-   mentre su un lato di 50 mm vale 0,01°. Ogni gruppo prende l'angolo "di progetto" se una sua linea ce l'ha già
-   esatto (es. 13,000°), altrimenti la direzione media pesata sulle lunghezze; poi viene agganciato a 0°/90°/griglia se vicino, e i
-   gruppi restanti vengono resi ortogonali a quelli già fissati se ci sono vicini.
+   mentre su un lato di 50 mm vale 0,01°. Ogni gruppo prende l'angolo "di
+   progetto" se una sua linea ce l'ha già esatto (es. 13,000° o 29,000°),
+   altrimenti la direzione media pesata sulle lunghezze; poi viene agganciato a
+   0°/90°/griglia se vicino (un angolo tondo esatto come 29° non viene mai
+   portato a 30°), e i gruppi restanti vengono resi ortogonali a quelli già
+   fissati se ci sono vicini.
 3. **Tangenze** – in ogni giunzione arco/segmento (o arco/arco) quasi tangente
    (≤ `tangent-tol`), si percorre la catena di entità tangenti: fra due segmenti
    di direzione ormai esatta la somma degli angoli al centro degli archi deve
@@ -42,11 +46,16 @@ Errori corretti (tutti nell'ordine dei centesimi/millesimi di mm o di grado):
    I raggi dei raccordi restano quelli di progetto (arrotondati al centesimo se
    ci sono vicini): con direzione della corda nota, anche il raggio è un
    vincolo lineare.
-4. **Spessori di parete** – due segmenti paralleli affacciati, con il pieno del
-   profilo in mezzo (verificato sui contorni chiusi) e nessun altro segmento fra
-   loro, sono una parete: la loro distanza viene portata al multiplo di
-   `--wall-step` (default 0,1 mm, le cartelle hanno al massimo un decimale) se lo
-   scarto è entro `--wall-tol`. Le cave/luci (vuoto in mezzo) non vengono toccate.
+4. **Distanze al decimo** (`--wall-step`, default 0,1 mm):
+   - **linee orizzontali e verticali**: tutte le distanze fra loro sono multipli di
+     0,1 mm. Le linee di ciascuna direzione vengono messe su una griglia di passo
+     0,1 la cui origine è quella su cui cade già la maggior parte delle linee
+     (pesate per lunghezza): le linee già in passo restano *ferme*, si spostano solo
+     quelle fuori passo. Una linea esattamente a metà fra due decimi (scarto
+     ≈ 0,05) non si può decidere: resta com'è ed è segnalata come NOTA;
+   - **spessori cartella**: due segmenti paralleli di qualunque direzione,
+     affacciati, a non più di `--wall-max` (default 4 mm) e senza altri segmenti
+     fra loro, vengono portati a distanza multipla di 0,1 mm.
 5. **Vincoli lineari** – fissate le direzioni, ogni condizione diventa un'equazione
    *lineare* nelle coordinate dei vertici, ad esempio per un segmento A→B di
    direzione con normale `n`: `n · (B − A) = 0`; per due segmenti collineari:
@@ -66,7 +75,9 @@ Errori corretti (tutti nell'ordine dei centesimi/millesimi di mm o di grado):
    Gli scarti oltre `max-angle` (es. un lato a 93°) non vengono toccati.
    Se un vincolo facoltativo (spessore, raggio, collinearità, allineamento)
    richiederebbe spostamenti eccessivi o contraddice gli altri, viene scartato e
-   segnalato come NOTA (priorità: spessori, raggi, collinearità, allineamenti).
+   segnalato come NOTA (priorità: distanze al decimo, collinearità, raggi,
+   allineamenti). Se un raggio viene lasciato libero solo per far chiudere una
+   catena di raccordi (scarti di milionesimi di mm) è riportato nel dettaglio.
 
 ## Uso su Windows (passo passo)
 
@@ -117,14 +128,14 @@ Opzioni principali:
 |---|---|---|
 | `--lin-tol` | 0.02 mm | errore lineare massimo considerato micro-errore |
 | `--angle-tol` | 0.1° | errore angolare sempre corretto |
-| `--max-angle` | 1.0° | errore angolare massimo correggibile (segmenti corti) |
+| `--max-angle` | 0.25° | errore angolare massimo correggibile (segmenti corti) |
 | `--angle-step` | 15° | griglia angolare; `0` = solo 0°/90° |
 | `--tangent-tol` | 1.0° | oltre questo scarto una giunzione è uno spigolo vivo |
 | `--merge-tol` | = lin-tol | distanza di fusione dei vertici |
 | `--max-move` | 5 × lin-tol | spostamento massimo ammesso di un vertice |
-| `--wall-step` | 0.1 mm | gli spessori di parete sono multipli di questo; `0` = non toccarli |
-| `--wall-tol` | 0.049 mm | scarto massimo di uno spessore dal valore arrotondato |
-| `--max-wall` | 10 mm | oltre questa distanza due linee non sono una parete |
+| `--wall-step` | 0.1 mm | passo di distanze e spessori; `0` = non toccarli |
+| `--wall-tol` | 0.049 mm | scarto massimo di una distanza dal valore arrotondato |
+| `--wall-max` | 4 mm | linee parallele fino a questa distanza sono spessori cartella |
 | `--no-align-vertices` | | non allineare i vertici in X/Y |
 | `--layers A,B` | tutti | elabora solo alcuni layer |
 | `--include-blocks` | | corregge anche le definizioni di blocco |

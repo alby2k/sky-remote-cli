@@ -260,3 +260,32 @@ def test_wall_thickness_snapped_to_one_decimal_and_radii_kept():
                 (x0, y0), (x1, y1) = pts[k], pts[(k + 1) % len(pts)]
                 r = math.hypot(x1 - x0, y1 - y0) / (2 * abs(math.sin(2 * math.atan(b))))
                 assert abs(r - r_expected) < 1e-9
+
+
+def test_axis_line_distances_are_one_decimal():
+    # profilo a gradino: le orizzontali a y=0 e y=10 sono in passo, il gradino
+    # a y=7.954 no -> deve andare a 8.0 senza muovere le altre
+    pts = [(0, 0), (30, 0), (30, 7.954), (20, 7.954), (20, 10), (0, 10)]
+    fixed, report = fix_contours([Contour("p", pts, [0] * 6, closed=True)])
+    out = fixed[0].points
+    assert not report.warnings
+    assert [p[1] for p in out] == [0, 0, 8.0, 8.0, 10, 10]
+    assert [p[0] for p in out] == [0, 30, 30, 20, 20, 0]
+
+
+def test_half_step_distance_is_reported_not_guessed():
+    # 7.95 è a metà fra 7.9 e 8.0: non si può decidere, la linea resta e si segnala
+    pts = [(0, 0), (30, 0), (30, 7.95), (20, 7.95), (20, 10), (0, 10)]
+    fixed, report = fix_contours([Contour("p", pts, [0] * 6, closed=True)], Params(wall_tol=0.04))
+    assert fixed[0].points[2][1] == 7.95
+    assert any("non riconducibile al decimo" in note for note in report.notes)
+
+
+def test_exact_round_angle_is_design_not_error():
+    # un tratto corto a 29° esatti non va "agganciato" a 30°
+    r = math.radians(29)
+    p2 = (10 + 0.29 * math.cos(r), 0.29 * math.sin(r))
+    pts = [(0, 0), (10, 0), p2, (p2[0], 5), (0, 5)]
+    fixed, _ = fix_contours([Contour("p", pts, [0] * 5, closed=True)], Params(wall_step=0))
+    (x1, y1), (x2, y2) = fixed[0].points[1:3]
+    assert abs(math.degrees(math.atan2(y2 - y1, x2 - x1)) - 29) < 1e-9

@@ -21,8 +21,8 @@ def build_parser() -> argparse.ArgumentParser:
                    help="tolleranza lineare in mm (default 0.02)")
     p.add_argument("--angle-tol", type=float, default=0.1,
                    help="errore angolare sempre corretto, in gradi (default 0.1)")
-    p.add_argument("--max-angle", type=float, default=1.0,
-                   help="errore angolare massimo correggibile sui segmenti corti (default 1.0)")
+    p.add_argument("--max-angle", type=float, default=0.25,
+                   help="errore angolare massimo correggibile sui segmenti corti (default 0.25)")
     p.add_argument("--angle-step", type=float, default=15.0,
                    help="griglia angolare in gradi; 0 = solo 0/90 (default 15)")
     p.add_argument("--tangent-tol", type=float, default=1.0,
@@ -36,8 +36,9 @@ def build_parser() -> argparse.ArgumentParser:
                         "0 = non correggere gli spessori (default 0.1)")
     p.add_argument("--wall-tol", type=float, default=0.049,
                    help="scarto massimo di uno spessore dal valore arrotondato (default 0.049)")
-    p.add_argument("--max-wall", type=float, default=10.0,
-                   help="spessore massimo considerato parete, in mm (default 10)")
+    p.add_argument("--wall-max", type=float, default=4.0,
+                   help="linee parallele fino a questa distanza (mm) sono spessori di "
+                        "cartella, arrotondati al decimo (default 4)")
     p.add_argument("--no-align-vertices", action="store_true",
                    help="non allineare in X/Y i vertici quasi allineati")
     p.add_argument("--layers", help="elabora solo questi layer (separati da virgola)")
@@ -58,7 +59,7 @@ def main(argv: list[str] | None = None) -> int:
                     angle_step=args.angle_step, tangent_tol=args.tangent_tol,
                     merge_tol=args.merge_tol, max_move=args.max_move,
                     align_vertices=not args.no_align_vertices, wall_step=args.wall_step,
-                    wall_tol=args.wall_tol, max_wall=args.max_wall)
+                    wall_tol=args.wall_tol, wall_max=args.wall_max)
     layers = set(args.layers.split(",")) if args.layers else None
 
     dxf_io.setup_oda(args.oda)

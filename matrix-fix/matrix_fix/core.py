@@ -37,15 +37,15 @@ from scipy.spatial import cKDTree
 class Params:
     lin_tol: float = 0.02  # mm: errore lineare massimo considerato "micro-errore"
     angle_tol: float = 0.1  # gradi: errore angolare sempre corretto
-    max_angle: float = 1.0  # gradi: limite assoluto (vale per segmenti corti)
+    max_angle: float = 0.25  # gradi: limite assoluto (vale per segmenti corti)
     angle_step: float = 15.0  # gradi: griglia angolare (0 = solo 0°/90°)
     tangent_tol: float = 1.0  # gradi: oltre questo una giunzione è uno spigolo
     merge_tol: float | None = None  # mm: default = lin_tol
     align_vertices: bool = True
     max_move: float | None = None  # mm: default = 5 * lin_tol
-    wall_step: float = 0.1  # mm: gli spessori di parete sono multipli di questo (0 = no)
-    wall_tol: float = 0.049  # mm: scarto massimo di uno spessore dal valore arrotondato
-    max_wall: float = 10.0  # mm: oltre questa distanza due linee non sono una parete
+    wall_step: float = 0.1  # mm: distanze fra linee parallele multiple di questo (0 = no)
+    wall_tol: float = 0.049  # mm: scarto massimo di una distanza dal valore arrotondato
+    wall_max: float = 4.0  # mm: linee parallele fino a questa distanza sono pareti (cartelle)
 
     @property
     def merge(self) -> float:
@@ -96,6 +96,8 @@ class Report:
     skipped_constraints: int = 0
     walls: int = 0
     walls_changed: int = 0
+    grid_lines: int = 0
+    grid_changed: int = 0
     radii_kept: int = 0
     max_line_deviation_deg: float = 0.0
     max_displacement: float = 0.0
@@ -115,7 +117,8 @@ class Report:
             ("Archi resi tangenti", self.tangent_arcs),
             ("Gruppi di segmenti resi collineari", self.collinear_groups),
             ("Gruppi di vertici allineati", self.aligned_vertex_groups),
-            ("Spessori di parete vincolati (di cui corretti)", f"{self.walls} ({self.walls_changed})"),
+            ("Linee con distanze al decimo (distanze corrette)", f"{self.grid_lines} ({self.grid_changed})"),
+            ("Spessori cartella vincolati (di cui corretti)", f"{self.walls} ({self.walls_changed})"),
             ("Raggi di raccordo conservati", self.radii_kept),
             ("Vincoli facoltativi scartati", self.skipped_constraints),
             ("Errore angolare massimo trovato [°]", f"{self.max_line_deviation_deg:.6f}"),
@@ -209,6 +212,7 @@ class _DirGroup:
     lmax: float = 0.0
     total: float = 0.0
     fixed: bool = False
+    exact: bool = False
 
 
 class _Fixer:
@@ -340,7 +344,7 @@ class _Fixer:
                 exact = round(deg * 100) / 100
                 if abs(deg - exact) < 1e-7:
                     g.angle = exact % 180.0
-                    g.fixed = True
+                    g.fixed = g.exact = True
                     break
 
         # aggancio alla griglia angolare (0° e 90° sempre)
@@ -352,6 +356,8 @@ class _Fixer:
                 candidates += [(k - 1) * step, k * step, (k + 1) * step]
             target = min(candidates, key=lambda c: abs(g.angle - c))
             d = math.radians(abs(g.angle - target))
+            if g.exact and d > math.radians(self.p.angle_tol):
+                continue  # un angolo tondo esatto (es. 29°) è di progetto: resta
             if self._within(d, g.lmax):
                 g.angle = target % 180.0
                 g.fixed = True
@@ -495,47 +501,6 @@ class _Fixer:
             self.report.tangent_arcs += 1
 
     # -- 4/5. vincoli e risoluzione -----------------------------------------
-    def _material_test(self):
-        """Funzione punto -> True se il punto è nel pieno del profilo (regola pari/dispari
-        sui contorni chiusi). Senza contorni chiusi non si può sapere: sempre True."""
-        polys = []
-        for nodes, bulges, _src, closed, edge_ids in self.sequences:
-            if not closed or not edge_ids:
-                continue
-            pts = []
-            for k, ei in enumerate(edge_ids):
-                e = self.edges[ei]
-                pa = self.nodes[e.a]
-                pts.append(pa)
-                if not e.is_line:
-                    pb = self.nodes[e.b]
-                    chord = float(np.hypot(*(pb - pa)))
-                    u = (pb - pa) / chord
-                    b = e.bulge
-                    h = chord * (1 - b * b) / (4 * b)
-                    c = (pa + pb) / 2 + np.array([-u[1], u[0]]) * h
-                    a0 = math.atan2(pa[1] - c[1], pa[0] - c[0])
-                    alpha = 4 * math.atan(b)
-                    rad = float(np.hypot(*(pa - c)))
-                    for t in np.linspace(0, 1, 17)[1:-1]:
-                        a = a0 + alpha * t
-                        pts.append(c + rad * np.array([math.cos(a), math.sin(a)]))
-            polys.append(np.array(pts))
-        if not polys:
-            return lambda pt: True
-
-        def inside(pt) -> bool:
-            count = 0
-            for poly in polys:
-                x, y = poly[:, 0], poly[:, 1]
-                x2, y2 = np.roll(x, -1), np.roll(y, -1)
-                cross = (y > pt[1]) != (y2 > pt[1])
-                with np.errstate(divide="ignore", invalid="ignore"):
-                    xi = x + (pt[1] - y) * (x2 - x) / (y2 - y)
-                count += int(np.count_nonzero(cross & (pt[0] < xi)) % 2)
-            return count % 2 == 1
-        return inside
-
     def build_constraints(self) -> None:
         # ogni vincolo è (coefficienti, termine noto) con un'etichetta: None = vincolo
         # essenziale (direzioni, tangenze), altrimenti descrive un vincolo facoltativo,
@@ -586,7 +551,6 @@ class _Fixer:
         for i, e in enumerate(self.edges):
             if e.is_line:
                 by_angle.setdefault(round(self.groups[e.group].angle, 9), []).append(i)
-        in_material = self._material_test() if self.p.wall_step > 0 else None
         for angle, members in by_angle.items():
             n = _normal(angle)
             u = (n[1], -n[0])
@@ -611,18 +575,51 @@ class _Fixer:
                     if self.edges[i].a != ref:
                         diff_row(collinear, n, ref, self.edges[i].a, tag=tag)
 
-            # spessori di parete: due segmenti paralleli affacciati, con il pieno in
-            # mezzo e nessun altro segmento fra loro, distano un multiplo di wall_step
-            if in_material is None:
+            if self.p.wall_step <= 0:
                 continue
             step = self.p.wall_step
+
+            # distanze al decimo fra tutte le linee orizzontali (e fra tutte le
+            # verticali): stanno su una griglia di passo ``step`` la cui origine è
+            # quella su cui cade già la maggior parte delle linee (pesate per
+            # lunghezza), così si spostano solo le linee "fuori passo"
+            grid = list(members) if angle in (0.0, 90.0) else []
+            if len(grid) > 1:
+                def miss(o, phase):
+                    return abs((o - phase + step / 2) % step - step / 2)
+                phases = [offset[i] % step for i in grid]
+                phase = min(phases, key=lambda ph: sum(
+                    self.edges[i].length * min(miss(offset[i], ph), self.p.wall_tol) for i in grid))
+                axis = 1 if angle == 0.0 else 0  # 0°: quota y, 90°: quota x
+                sign = n[axis]  # offset = sign * coordinata
+                for i in grid:
+                    target = phase + round((offset[i] - phase) / step) * step
+                    a = self.edges[i].a
+                    if abs(offset[i] - target) > self.p.wall_tol:
+                        self.report.notes.append(
+                            f"linea a {angle:g}° vicino a {where(a)}: distanza dalle altre non "
+                            f"riconducibile al decimo (scarto {offset[i] - target:+.4f} mm), lasciata")
+                        continue
+                    # quota assoluta sulla griglia: le linee già in passo restano ferme
+                    self.report.grid_lines += 1
+                    uf.union(i, grid[0])
+                    if abs(offset[i] - target) > 1e-6:
+                        self.report.grid_changed += 1
+                        self.report.details.append(
+                            f"linea a {angle:g}° vicino a {where(a)} spostata in {'XY'[axis]} di "
+                            f"{(target - offset[i]) * sign:+.6f} mm: distanze al decimo dalle altre")
+                    walls.append(([(2 * a + axis, sign)], target,
+                                  f"quota al decimo a {angle:g}° vicino a {where(a)}"))
+
+            # spessori delle cartelle: due segmenti paralleli affacciati, a non più di
+            # ``wall_max`` e senza altri segmenti fra loro, distano un multiplo di ``step``
             ordered = sorted(members, key=lambda i: offset[i])
             pairs = []
             for x, i in enumerate(ordered):
                 for y in range(x + 1, len(ordered)):
                     j = ordered[y]
                     d = offset[j] - offset[i]
-                    if d > self.p.max_wall:
+                    if d > self.p.wall_max + self.p.wall_tol:
                         break
                     if d <= self.p.lin_tol:
                         continue
@@ -636,9 +633,6 @@ class _Fixer:
                            and min(hi, span[k][1]) - max(lo, span[k][0]) > 0
                            for k in ordered[x + 1:y]):
                         continue  # c'è un altro segmento in mezzo: non è una parete
-                    s_mid, o_mid = (lo + hi) / 2, (offset[i] + offset[j]) / 2
-                    if not in_material((u[0] * s_mid + n[0] * o_mid, u[1] * s_mid + n[1] * o_mid)):
-                        continue  # in mezzo c'è il vuoto (cava, luce): non è una parete
                     pairs.append((d, i, j, t))
             for d, i, j, t in sorted(pairs):
                 if uf.find(i) == uf.find(j):
@@ -646,7 +640,7 @@ class _Fixer:
                 uf.union(i, j)
                 a = self.edges[i].a
                 self.report.walls += 1
-                if abs(d - t) > 1e-9:
+                if abs(d - t) > 1e-6:
                     self.report.walls_changed += 1
                     self.report.details.append(
                         f"spessore parete a {angle:g}° vicino a {where(a)}: {d:.6f} -> {t:g} mm")
@@ -673,7 +667,7 @@ class _Fixer:
                         if ref is not None:
                             aligned.append(([(2 * i + axis, 1.0), (2 * ref + axis, -1.0)], 0.0, tag))
                             linked.append(i)
-        self.constraints = core + walls + radii + collinear + aligned
+        self.constraints = core + walls + collinear + radii + aligned
 
     def _unchanged(self, e: _Edge) -> bool:
         if e.is_line:
@@ -737,8 +731,15 @@ class _Fixer:
         groups: dict[int, list[int]] = {}
         for i in range(nvar):
             groups.setdefault(uf.find(i), []).append(i)
+        pinned = {row[0][0]: rhs / row[0][1] for row, rhs, _tag in cons
+                  if len(row) == 1 and abs(row[0][1]) == 1.0}
         for members in groups.values():
-            if len(members) > 1:
+            value = next((pinned[m] for m in members if m in pinned), None)
+            if value is not None:
+                # quota imposta: esatta (se era già giusta resta il valore originale)
+                same = [v0[m] for m in members if abs(v0[m] - value) < 1e-9]
+                v[members] = same[0] if same else value
+            elif len(members) > 1:
                 v[members] = float(np.mean(v[members]))
         return v, float(np.max(np.abs(b - A @ v)))
 
